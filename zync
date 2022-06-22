@@ -1,0 +1,304 @@
+#!/bin/bash
+
+###########################
+# CONFIGURABLE PARAMETERS
+###########################
+DEFAULT_CONFIG_FILE_PATH=~/.config/zync.conf
+COPY_PUB_KEY='true' # empty string for false
+RSYNC_ARGS='-a -u -P --delete'
+SSH_CMD_ARGS='' # e.g. add -o StrictHostKeyChecking=no
+
+###########################
+# VARIABLES
+###########################
+
+keyfile=
+user=
+host=
+CFD='4' # File descriptor of the config file that is opened
+
+###########################
+# HELPERS
+###########################
+
+usage() {
+  echo "$1" >&2
+
+  printf "
+Usage: %s [-c ./other-zync.conf] cmd
+
+  -c file     path to the config file to read. Default: %s
+
+CMDS:
+  push alias
+  pull alias
+    either push or pull from the alias specified in the zync.conf
+  list
+    list all aliases specified in the zync.conf
+
+-------------------------------------------------------------------------------
+
+CONFIG FORMAT:
+
+  [alias name]
+  [[config]]
+  user remote-user
+  host ip/domain
+  key ~/.ssh/your-public-key.pub
+  [[files]]
+  # TYPE      PATH HERE       PATH THERE      IGNORE
+  d|f         /path           ~/other/path     fileA,dirB/
+  ...
+
+  [other alias name]
+  [[config]]
+  ...
+.....
+" "$(basename "$0")" "$DEFAULT_CONFIG_FILE_PATH" >&2
+
+  exit 1
+}
+
+die() {
+  echo "$1" >&2
+  exit 1
+}
+
+
+is_alias() {
+  case "$1" in
+    '['*']')  return 0 ;;
+    *)        return 1 ;;
+  esac
+}
+
+# TODO: NAMING
+is_descriptor() {
+  case "$1" in
+    '[['*']]')  return 0 ;;
+    *)          return 1 ;;
+  esac
+}
+
+assert_path_absolute() {
+  if [ "${p:0:1}" != '/' ]; then
+    die "'$p' is neither absolute nor starts with '~' !"
+  fi
+}
+
+clean_local_path() {
+    p="$1"
+
+    # manual tilde expansion
+    if [ "${p:0:1}" = '~' ]; then
+      p="${HOME}${p:1}"
+    fi
+
+    assert_path_absolute "$p"
+    echo "$p"
+}
+
+clean_remote_path() {
+    p="${1:?clean_remote_path expected an argument}"
+
+    # manual tilde expansion
+    if [ "${p:0:1}" = '~' ]; then
+      p="/home/${user}${p:1}"
+    fi
+
+    assert_path_absolute "$p"
+    echo "$p"
+}
+
+str_contains() {
+    hey="$1"
+    needle="$2"
+
+    case "$hey" in
+      *"${needle}"*) return 0 ;;
+      *) return 1 ;;
+    esac
+}
+
+open_config() {
+  path="$1"
+
+  # Ignore empty lines
+  # Ignore comments
+  # Left and right trim
+  sed \
+    -e '/^\s*$/d' \
+    -e '/\s*#/d'  \
+    -e 's/^\s*//' \
+    -e 's/\s*$//' \
+    "$path"
+
+  # write out final new line just in case the
+  # config file does not end with one
+  echo ""
+}
+
+read_config_of_alias() {
+  name="$1" # optional
+
+  # read until alias line is found
+  found=''
+  while read -r -u $CFD line; do
+    if is_alias "$line"; then
+      alias="${line:1:$((${#line}-2))}"
+
+      if [ -z "$name" ] || [ "$alias" = "$name" ]; then
+        found="y"
+        break
+      fi
+    fi
+  done
+
+  # indicate that not found
+  [ -z "$found" ] && return 1
+
+  # ensure that next line is [[config]]
+  read -r -u $CFD line
+  if ! is_descriptor "$line" || [ "${line,,}" != '[[config]]' ] ; then
+    usage "Expected [[config]] after alias but found '$line'"
+  fi
+
+  # Process all config elements
+  while read -r -u $CFD line; do
+    IFS=" " read -r key value <<< "$line"
+    case "${key,,}" in
+      user) user="$value"   ;;
+      host) host="$value"   ;;
+      key)  keyfile="$value" ;;
+
+      '[[files]]') break ;;
+      *) die "Unknown key '$key' in config." ;;
+    esac
+  done
+
+  # indicate that found
+  return 0
+}
+
+list_aliases() {
+  while read_config_of_alias; do
+    echo "$alias: $user@$host"
+  done
+}
+
+sync_alias() {
+  mode="$1" # pull or push
+  name="$2" # name of the alias
+
+  if ! read_config_of_alias "$name"; then
+    die "Did not find alias '$name' in config file"
+  fi
+
+  keyfile="$(clean_local_path "$keyfile")"
+
+  [ -f "$keyfile" ] || die "The key '$keyfile' does not exist!"
+
+  if [ -n "$COPY_PUB_KEY" ]; then
+    ssh-copy-id -i "$keyfile" ${SSH_CMD_ARGS:+-o "$SSH_CMD_ARGS"} "$user@$host" 2>/dev/null
+  fi
+
+  # NOTE: [[files]] is comsumed by read_config_of_alias
+
+  while read -r -u $CFD line; do
+    [ -z "$line" ] && continue
+    is_alias "$line" && break
+
+    read -r path_type here there ignores <<< "$line"
+
+    here="$(clean_local_path "$here")"
+    there="$(clean_remote_path "$there")"
+
+    # handle path type
+    case "${path_type,,}" in
+      f)
+        # remove suffix '/' if present = copy onto for files
+        here="${here%%*(/)}"
+        there="${there%%*(/)}"
+        ;;
+      d)
+
+        # remove all final '/' and add one back so that we
+        # can be sure that there is exactly one = copy onto for dirs
+        here="${here%%*(/)}/"
+        there="${there%%*(/)}/"
+        ;;
+      *) die "Unknown path type '$path_type' on line '$line'" ;;
+    esac
+
+    if [ "$mode" = 'push' ] && ! [ -e "$here" ]; then
+      die "The file/dir '$here' that you want to push does not exist!"
+    fi
+
+    if [ "$mode" = "pull" ]; then
+      [ "$path_type" = 'd' ] && ! [ -d "$here" ] && mkdir -p "$here"
+      [ "$path_type" = 'f' ] && ! [ -d "$(dirname "$here")" ] && mkdir -p "$(dirname "$here")"
+    fi
+
+    # build additional exclude params for rsync
+    exclude=
+    while read -d ',' -r ignore_path; do
+      [ -z "$ignore_path" ] && continue
+      exclude="--exclude $ignore_path $exclude" # TODO: how to quote properly??
+    done <<< "$ignores,"
+
+    # determine real src dst for rsync cmd
+    src='' dst=''
+    case "$mode" in
+      pull) src="$user@$host:$there" ; dst="$here" ;;
+      push) src="$here" ; dst="$user@$host:$there";;
+      *) usage 'Invalid mode! Only push and pull are allowed for syncing!!' ;;
+    esac
+
+    rsync $RSYNC_ARGS --rsh "ssh $SSH_CMD_ARGS -i $keyfile"  $exclude $src $dst
+  done
+}
+
+###########################
+# READ FLAGS
+###########################
+while [ -n "$1" ]; do
+  case "$1" in
+    -c)
+      [ -z "$2" ] && usage "-c requires an argument"
+      [ -f "$2" ] || usage "'$2' is not a file"
+      cfgfile="$2"
+      shift 2
+      ;;
+    *)
+      case "$1" in
+        -*) usage "Argument '$1 'is not known" ;;
+        *) break ;; # start of positionals
+      esac
+      ;;
+  esac
+done
+
+###########################
+# CHECK FLAGS
+###########################
+# open the right config file
+if [ -z "$cfgfile" ]; then
+  if ! [ -f "$DEFAULT_CONFIG_FILE_PATH" ]; then
+    usage "There is no config at '$DEFAULT_CONFIG_FILE_PATH' :c"
+  fi
+  eval "exec $CFD< <(open_config $DEFAULT_CONFIG_FILE_PATH)"
+else
+  eval "exec $CFD< <(open_config $cfgfile)"
+fi
+
+###########################
+# READ AND EXEC COMMAND
+###########################
+case "${1,,}" in
+  list) list_aliases ;;
+  pull|push)
+    [ -z "$2" ] && usage "Expected name of the alias to sync"
+    sync_alias "$1" "$2"
+    ;;
+  *) usage "Unknown command '$1'" ;;
+esac
