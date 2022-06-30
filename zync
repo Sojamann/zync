@@ -1,11 +1,11 @@
-#!/bin/bash
+#!/bin/sh
 
 ###########################
 # CONFIGURABLE PARAMETERS
 ###########################
 DEFAULT_CONFIG_FILE_PATH=~/.config/zync.conf
 COPY_PUB_KEY='true' # empty string for false
-RSYNC_ARGS='-a -u -P --delete'
+RSYNC_ARGS='-z -a -u -P --delete'
 SSH_CMD_ARGS='' # e.g. add -o StrictHostKeyChecking=no
 
 ###########################
@@ -72,17 +72,9 @@ is_alias() {
   esac
 }
 
-# TODO: NAMING
-is_descriptor() {
-  case "$1" in
-    '[['*']]')  return 0 ;;
-    *)          return 1 ;;
-  esac
-}
-
 assert_path_absolute() {
-  if [ "${p:0:1}" != '/' ]; then
-    die "'$p' is neither absolute nor starts with '~' !"
+  if [ "$(str_slice "$1" '1' '1')" != '/' ]; then
+    die "'$1' is neither absolute nor starts with '~' !"
   fi
 }
 
@@ -90,8 +82,8 @@ clean_local_path() {
     p="$1"
 
     # manual tilde expansion
-    if [ "${p:0:1}" = '~' ]; then
-      p="${HOME}${p:1}"
+    if [ "$(str_slice "$p" '1' '1')" = '~' ]; then
+      p="${HOME}$(str_slice "$p" '2')"
     fi
 
     assert_path_absolute "$p"
@@ -102,8 +94,8 @@ clean_remote_path() {
     p="${1:?clean_remote_path expected an argument}"
 
     # manual tilde expansion
-    if [ "${p:0:1}" = '~' ]; then
-      p="/home/${user}${p:1}"
+    if [ "$(str_slice "$p" '1' '1')" = '~' ]; then
+      p="/home/${user}$(str_slice "$p" '2')"
     fi
 
     assert_path_absolute "$p"
@@ -120,8 +112,21 @@ str_contains() {
     esac
 }
 
+str_slice() {
+  str="$1"
+  start_offset="$2"
+  end_offset="$3"
+
+  echo "$str" | cut -c "$start_offset"-"$end_offset"
+}
+
+str_lower() {
+  echo "$1" | tr '[:upper:]' '[:lower:]'
+}
+
 open_config() {
   path="$1"
+  tmpf="$(mktemp)"
 
   # Ignore empty lines
   # Ignore comments
@@ -131,11 +136,14 @@ open_config() {
     -e '/\s*#/d'  \
     -e 's/^\s*//' \
     -e 's/\s*$//' \
-    "$path"
+    "$path" > "$tmpf"
 
   # write out final new line just in case the
   # config file does not end with one
-  echo ""
+  echo "" >> "$tmpf"
+
+  eval "exec $CFD< $tmpf"
+  rm "$tmpf" # we have a handle so we can remove the file
 }
 
 read_config_of_alias() {
@@ -143,30 +151,29 @@ read_config_of_alias() {
 
   # read until alias line is found
   found=''
-  while read -r -u $CFD line; do
+  while read -r line; do
     if is_alias "$line"; then
-      alias="${line:1:$((${#line}-2))}"
+      alias="$(str_slice "$line" '2' "$((${#line}-1))")"
 
       if [ -z "$name" ] || [ "$alias" = "$name" ]; then
         found="y"
         break
       fi
     fi
-  done
+  done <&${CFD}
 
   # indicate that not found
   [ -z "$found" ] && return 1
 
   # ensure that next line is [[config]]
-  read -r -u $CFD line
-  if ! is_descriptor "$line" || [ "${line,,}" != '[[config]]' ] ; then
+  read -r line <&${CFD}
+  if [ "$(str_lower "$line")" != '[[config]]' ] ; then
     usage "Expected [[config]] after alias but found '$line'"
-  fi
+  fi <&${CFD}
 
   # Process all config elements
-  while read -r -u $CFD line; do
-    IFS=" " read -r key value <<< "$line"
-    case "${key,,}" in
+  while read -r key value; do
+    case "$(str_lower "$key")" in
       user) user="$value"   ;;
       host) host="$value"   ;;
       key)  keyfile="$value" ;;
@@ -174,7 +181,7 @@ read_config_of_alias() {
       '[[files]]') break ;;
       *) die "Unknown key '$key' in config." ;;
     esac
-  done
+  done <&${CFD}
 
   # indicate that found
   return 0
@@ -204,17 +211,15 @@ sync_alias() {
 
   # NOTE: [[files]] is comsumed by read_config_of_alias
 
-  while read -r -u $CFD line; do
-    [ -z "$line" ] && continue
-    is_alias "$line" && break
-
-    read -r path_type here there ignores <<< "$line"
+  while read -r path_type here there ignores; do
+    [ -z "$path_type" ] && continue
+    is_alias "$path_type" && break
 
     here="$(clean_local_path "$here")"
     there="$(clean_remote_path "$there")"
 
     # handle path type
-    case "${path_type,,}" in
+    case "$(str_lower "$path_type")" in
       f)
         # remove suffix '/' if present = copy onto for files
         here="${here%%*(/)}"
@@ -240,22 +245,28 @@ sync_alias() {
     fi
 
     # build additional exclude params for rsync
-    exclude=
-    while read -d ',' -r ignore_path; do
+    exclude=""
+  IFS=','
+    for ignore_path in $ignores; do
       [ -z "$ignore_path" ] && continue
       exclude="--exclude $ignore_path $exclude" # TODO: how to quote properly??
-    done <<< "$ignores,"
+    done
+  unset IFS
 
     # determine real src dst for rsync cmd
-    src='' dst=''
+    src="" dst=""
     case "$mode" in
       pull) src="$user@$host:$there" ; dst="$here" ;;
       push) src="$here" ; dst="$user@$host:$there";;
       *) usage 'Invalid mode! Only push and pull are allowed for syncing!!' ;;
     esac
 
-    rsync $RSYNC_ARGS --rsh "ssh $SSH_CMD_ARGS -i $keyfile"  $exclude $src $dst
-  done
+    rsync $RSYNC_ARGS \
+      --rsync-path "mkdir -p $there && rsync" \
+      --rsh "ssh $SSH_CMD_ARGS -i $keyfile" \
+      $exclude "$src" "$dst"
+
+  done <&${CFD}
 }
 
 ###########################
@@ -286,15 +297,15 @@ if [ -z "$cfgfile" ]; then
   if ! [ -f "$DEFAULT_CONFIG_FILE_PATH" ]; then
     usage "There is no config at '$DEFAULT_CONFIG_FILE_PATH' :c"
   fi
-  eval "exec $CFD< <(open_config $DEFAULT_CONFIG_FILE_PATH)"
+  open_config "$DEFAULT_CONFIG_FILE_PATH"
 else
-  eval "exec $CFD< <(open_config $cfgfile)"
+  open_config "$cfgfile"
 fi
 
 ###########################
 # READ AND EXEC COMMAND
 ###########################
-case "${1,,}" in
+case "$(str_lower "$1")" in
   list) list_aliases ;;
   pull|push)
     [ -z "$2" ] && usage "Expected name of the alias to sync"

@@ -7,7 +7,8 @@ ensures that all files of all different hosts can be organized in one place.
 
 ## Install
 ```
-install -Dpm 755 ./zync /usr/local/bin/zync
+sudo install -Dpm 750 ./zync /usr/local/bin/zync
+sudo chown user:group /usr/local/bin/zync
 ```
 
 ## Usage
