@@ -249,7 +249,7 @@ sync_alias() {
   IFS=','
     for ignore_path in $ignores; do
       [ -z "$ignore_path" ] && continue
-      exclude="--exclude $ignore_path $exclude" # TODO: how to quote properly??
+      exclude="--exclude '$ignore_path' $exclude"
     done
   unset IFS
 
@@ -261,13 +261,28 @@ sync_alias() {
       *) usage 'Invalid mode! Only push and pull are allowed for syncing!!' ;;
     esac
 
+    # ensure that parent dir of the target exists
+    rsync_path='rsync'
+    if [ "$mode" = 'push' ]; then
+      rsync_path="'mkdir -p $(dirname "$there") && rsync'"
+    fi
+
     rsync $RSYNC_ARGS \
-      --rsync-path "mkdir -p $there && rsync" \
-      --rsh "ssh $SSH_CMD_ARGS -i $keyfile" \
+      --rsync-path "$rsync_path" \
+      --rsh "'ssh $SSH_CMD_ARGS -i $keyfile'" \
       $exclude "$src" "$dst"
 
   done <&${CFD}
 }
+
+###########################
+# CHECK REQUIREMENTS
+###########################
+type mkdir >/dev/null 2>&1 || die "mkdir does not seem to be installed!!"
+type dirname >/dev/null 2>&1 || die "dirname does not seem to be installed!!"
+type ssh-copy-id >/dev/null 2>&1 || die "ssh-copy-id does not seem to be installed!!"
+type mktemp >/dev/null 2>&1 || die "mktemp does not seem to be installed!!"
+type rsync >/dev/null 2>&1 || die "rsync does not seem to be installed!!"
 
 ###########################
 # READ FLAGS
