@@ -103,10 +103,10 @@ clean_remote_path() {
 }
 
 str_contains() {
-    hey="$1"
+    hay="$1"
     needle="$2"
 
-    case "$hey" in
+    case "$hay" in
       *"${needle}"*) return 0 ;;
       *) return 1 ;;
     esac
