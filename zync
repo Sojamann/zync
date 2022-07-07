@@ -6,7 +6,7 @@
 DEFAULT_CONFIG_FILE_PATH=~/.config/zync.conf
 COPY_PUB_KEY='true' # empty string for false
 RSYNC_ARGS='-z -a -u -P --delete'
-SSH_CMD_ARGS='' # e.g. add -o StrictHostKeyChecking=no
+SSH_CMD_ARGS='' # e.g. add StrictHostKeyChecking=no
 
 ###########################
 # VARIABLES
@@ -206,7 +206,7 @@ sync_alias() {
   [ -f "$keyfile" ] || die "The key '$keyfile' does not exist!"
 
   if [ -n "$COPY_PUB_KEY" ]; then
-    ssh-copy-id -i "$keyfile" ${SSH_CMD_ARGS:+-o "$SSH_CMD_ARGS"} "$user@$host" 2>/dev/null
+    ssh-copy-id -i "$keyfile" ${SSH_CMD_ARGS:+-o $SSH_CMD_ARGS} "$user@$host" 2>/dev/null
   fi
 
   # NOTE: [[files]] is comsumed by read_config_of_alias
@@ -264,12 +264,12 @@ sync_alias() {
     # ensure that parent dir of the target exists
     rsync_path='rsync'
     if [ "$mode" = 'push' ]; then
-      rsync_path="'mkdir -p $(dirname "$there") && rsync'"
+      rsync_path="(mkdir -p $(dirname "$there") || true) && rsync"
     fi
 
     rsync $RSYNC_ARGS \
       --rsync-path "$rsync_path" \
-      --rsh "'ssh $SSH_CMD_ARGS -i $keyfile'" \
+      --rsh "ssh -i $keyfile ${SSH_CMD_ARGS:+-o $SSH_CMD_ARGS}" \
       $exclude "$src" "$dst"
 
   done <&${CFD}
